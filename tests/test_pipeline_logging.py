@@ -94,6 +94,28 @@ class PipelineLoggingTests(unittest.TestCase):
             self.assertIn("child stderr", log_output)
             self.assertIn("[done]", log_output)
 
+    def test_run_command_can_log_without_streaming_child_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_root = Path(tmp)
+            settings = resolve_pipeline_log_settings(
+                config={"logging": {"file": "pipeline.log"}},
+                project_root=project_root,
+                environ={},
+            )
+            configure_pipeline_logger(settings)
+            terminal = io.StringIO()
+            command = [sys.executable, "-u", "-c", "print('parallel child output')"]
+
+            with contextlib.redirect_stdout(terminal):
+                run_command(command, cwd=project_root, stream_output=False)
+            close_pipeline_logger()
+
+            self.assertNotIn("parallel child output", terminal.getvalue())
+            self.assertIn(
+                "parallel child output",
+                settings.path.read_text(encoding="utf-8"),
+            )
+
     def test_full_pipeline_accepts_log_cli_overrides(self):
         args = parse_args(
             [
@@ -104,6 +126,8 @@ class PipelineLoggingTests(unittest.TestCase):
                 "--no-file-log",
                 "--resume-dfs",
                 "--skip-dbinfer-validation",
+                "--dfs-jobs",
+                "32",
                 "--dbinfer-root",
                 "outputs/dbinfer_for_dfs/syn_v1",
             ]
@@ -113,7 +137,12 @@ class PipelineLoggingTests(unittest.TestCase):
         self.assertTrue(args.no_file_log)
         self.assertTrue(args.resume_dfs)
         self.assertTrue(args.skip_dbinfer_validation)
+        self.assertEqual(32, args.dfs_jobs)
         self.assertEqual(Path("outputs/dbinfer_for_dfs/syn_v1"), args.dbinfer_root)
+
+    def test_full_pipeline_rejects_nonpositive_dfs_jobs(self):
+        with self.assertRaises(SystemExit):
+            parse_args(["--dfs-jobs", "0"])
 
 
 if __name__ == "__main__":

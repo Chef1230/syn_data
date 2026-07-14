@@ -2,6 +2,8 @@ import json
 from pathlib import Path
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -10,6 +12,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from syn_data.src.rdb_prior.io.full_pipeline import (
+    bounded_parallel_map,
     dbinfer_dataset_is_complete,
     load_resume_dbinfer_datasets,
     remove_incomplete_stage_output,
@@ -37,6 +40,27 @@ def _write_complete_dataset(path: Path, dataset_name: str = "db_000000") -> None
 
 
 class FullPipelineResumeTests(unittest.TestCase):
+    def test_bounded_parallel_map_limits_concurrency(self):
+        lock = threading.Lock()
+        active = 0
+        peak_active = 0
+
+        def work(value):
+            nonlocal active, peak_active
+            with lock:
+                active += 1
+                peak_active = max(peak_active, active)
+            time.sleep(0.02)
+            with lock:
+                active -= 1
+            return value * 2
+
+        results = list(bounded_parallel_map(work, range(12), max_workers=3))
+
+        self.assertEqual([value * 2 for value in range(12)], sorted(results))
+        self.assertGreater(peak_active, 1)
+        self.assertLessEqual(peak_active, 3)
+
     def test_dataset_completeness_checks_referenced_files(self):
         with tempfile.TemporaryDirectory() as tmp:
             dataset_dir = Path(tmp) / "dataset"
@@ -131,7 +155,7 @@ class FullPipelineResumeTests(unittest.TestCase):
                 ("post-dfs transform", post_dir, "transform", processed_dir, "post.yaml"),
             ]
 
-            def fake_preprocess(_tool_root, _input, _name, output, _config):
+            def fake_preprocess(_tool_root, _input, _name, output, _config, **_kwargs):
                 _write_complete_dataset(Path(output))
 
             with mock.patch(
@@ -179,7 +203,7 @@ class FullPipelineResumeTests(unittest.TestCase):
                 ("post-dfs transform", post_dir, "transform", processed_dir, "post.yaml"),
             ]
 
-            def fake_preprocess(_tool_root, _input, _name, output, _config):
+            def fake_preprocess(_tool_root, _input, _name, output, _config, **_kwargs):
                 _write_complete_dataset(Path(output))
 
             with mock.patch(

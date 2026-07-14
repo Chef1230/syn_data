@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import codecs
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from functools import partial
 import json
 import logging
 from pathlib import Path
@@ -12,7 +14,7 @@ import shutil
 import subprocess
 import sys
 import time
-from typing import Any, Iterable, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Mapping, Sequence, TypeVar
 
 try:
     from tqdm import tqdm
@@ -29,6 +31,7 @@ from syn_data.src.rdb_prior.io.pipeline_logging import (
 )
 
 T = TypeVar("T")
+R = TypeVar("R")
 _LOGGER = get_pipeline_logger()
 
 
@@ -61,6 +64,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "With --resume-dfs, trust export_report.json and skip the per-dataset "
             "DBInfer metadata/table/task file validation."
         ),
+    )
+    parser.add_argument(
+        "--dfs-jobs",
+        type=_positive_int,
+        default=1,
+        help="Maximum number of databases processed concurrently within each DFS depth (default: 1).",
     )
     parser.add_argument("--dfs-h5-output-dir", type=Path, default=None, help="Override dfs_export.h5_output_dir.")
     parser.add_argument("--log-file", type=Path, default=None, help="Override logging.file.")
@@ -196,6 +205,7 @@ def execute_pipeline(
             h5_output_dir_override=args.dfs_h5_output_dir,
             resume=args.resume_dfs,
             skip_dbinfer_validation=args.skip_dbinfer_validation,
+            dfs_jobs=args.dfs_jobs,
         )
     else:
         _status("DFS export stage skipped")
@@ -256,6 +266,7 @@ def run_dfs_exports(
     h5_output_dir_override: Path | None = None,
     resume: bool = False,
     skip_dbinfer_validation: bool = False,
+    dfs_jobs: int = 1,
 ) -> dict[str, Any]:
     dfs_cfg = dict(config.get("dfs_export", {}))
     dbinfer_root = resolve_project_path(
@@ -310,7 +321,10 @@ def run_dfs_exports(
         dbinfer_mode = "exported"
     if not dataset_dirs:
         raise RuntimeError(f"No DBInfer datasets were exported under {dbinfer_root}")
+    if dfs_jobs < 1:
+        raise ValueError(f"dfs_jobs must be at least 1, got {dfs_jobs}.")
     _status(f"DBInfer datasets ready: {len(dataset_dirs)} from {dbinfer_root}")
+    _status(f"DFS dataset worker limit: {dfs_jobs}")
 
     depth_reports = []
     for depth in _progress(depths, "DFS export depths", "depth"):
@@ -321,31 +335,38 @@ def run_dfs_exports(
         stage_run_count = 0
         stage_skip_count = 0
         completed_dataset_skip_count = 0
-        for dataset_dir in _progress(dataset_dirs, f"DFS-{depth} datasets", "db"):
-            dataset_name = dataset_dir.name
-            pre_dir = pre_root / f"{dataset_name}-pre-dfs"
-            post_dir = post_root / f"{dataset_name}-post-dfs"
-            processed_dir = processed_root / f"{dataset_name}-dfs-{depth}"
-            if resume and dbinfer_dataset_is_complete(processed_dir)[0]:
-                completed_dataset_skip_count += 1
-                stage_skip_count += 3
-                _status(f"[resume] DFS-{depth} {dataset_name}: processed output complete; skipping dataset")
-                continue
-            stages = [
-                ("pre-dfs transform", dataset_dir, "transform", pre_dir, "configs/transform/pre-dfs.yaml"),
-                ("dfs", pre_dir, "dfs", post_dir, f"configs/dfs/dfs-{depth}-sql.yaml"),
-                ("post-dfs transform", post_dir, "transform", processed_dir, "configs/transform/post-dfs.yaml"),
-            ]
-            stage_report = run_dfs_stage_sequence(
-                stages=stages,
-                data_preprocessing_dir=data_preprocessing_dir,
-                dfs_workspace_root=dfs_workspace_root,
-                depth=depth,
-                dataset_name=dataset_name,
-                resume=resume,
+        run_one = partial(
+            run_one_dfs_dataset,
+            processed_root=processed_root,
+            pre_root=pre_root,
+            post_root=post_root,
+            data_preprocessing_dir=data_preprocessing_dir,
+            dfs_workspace_root=dfs_workspace_root,
+            depth=depth,
+            resume=resume,
+            stream_child_output=dfs_jobs == 1,
+        )
+        if dfs_jobs == 1:
+            dataset_reports = map(run_one, dataset_dirs)
+        else:
+            _status(
+                f"DFS-{depth}: running up to {dfs_jobs} databases concurrently; "
+                "child output is written to the pipeline log"
             )
-            stage_run_count += stage_report["stages_run"]
-            stage_skip_count += stage_report["stages_skipped"]
+            dataset_reports = bounded_parallel_map(
+                run_one,
+                dataset_dirs,
+                max_workers=dfs_jobs,
+            )
+        for dataset_report in _progress(
+            dataset_reports,
+            f"DFS-{depth} datasets",
+            "db",
+            total=len(dataset_dirs),
+        ):
+            stage_run_count += dataset_report["stages_run"]
+            stage_skip_count += dataset_report["stages_skipped"]
+            completed_dataset_skip_count += dataset_report["datasets_skipped_as_complete"]
 
         unsampled_h5 = h5_output_dir / str(dfs_cfg.get("unsampled_h5_name_template", "syn_dfs_{depth}_unsampled.h5")).format(depth=depth)
         final_h5 = h5_output_dir / str(dfs_cfg.get("h5_name_template", "syn_dfs_{depth}.h5")).format(depth=depth)
@@ -408,7 +429,58 @@ def run_dfs_exports(
         "workspace_root": str(dfs_workspace_root),
         "resume": resume,
         "dbinfer_validation_skipped": bool(resume and skip_dbinfer_validation),
+        "dfs_jobs": dfs_jobs,
         "depths": depth_reports,
+    }
+
+
+def run_one_dfs_dataset(
+    dataset_dir: Path,
+    *,
+    processed_root: Path,
+    pre_root: Path,
+    post_root: Path,
+    data_preprocessing_dir: Path,
+    dfs_workspace_root: Path,
+    depth: int,
+    resume: bool,
+    stream_child_output: bool,
+) -> dict[str, int]:
+    """Process one database while keeping all of its DFS stages sequential."""
+
+    dataset_name = dataset_dir.name
+    pre_dir = pre_root / f"{dataset_name}-pre-dfs"
+    post_dir = post_root / f"{dataset_name}-post-dfs"
+    processed_dir = processed_root / f"{dataset_name}-dfs-{depth}"
+    if resume and dbinfer_dataset_is_complete(processed_dir)[0]:
+        _status(
+            f"[resume] DFS-{depth} {dataset_name}: processed output complete; skipping dataset",
+            console=stream_child_output,
+        )
+        return {
+            "stages_run": 0,
+            "stages_skipped": 3,
+            "datasets_skipped_as_complete": 1,
+        }
+
+    stages = [
+        ("pre-dfs transform", dataset_dir, "transform", pre_dir, "configs/transform/pre-dfs.yaml"),
+        ("dfs", pre_dir, "dfs", post_dir, f"configs/dfs/dfs-{depth}-sql.yaml"),
+        ("post-dfs transform", post_dir, "transform", processed_dir, "configs/transform/post-dfs.yaml"),
+    ]
+    stage_report = run_dfs_stage_sequence(
+        stages=stages,
+        data_preprocessing_dir=data_preprocessing_dir,
+        dfs_workspace_root=dfs_workspace_root,
+        depth=depth,
+        dataset_name=dataset_name,
+        resume=resume,
+        show_progress=stream_child_output,
+        stream_child_output=stream_child_output,
+    )
+    return {
+        **stage_report,
+        "datasets_skipped_as_complete": 0,
     }
 
 
@@ -419,6 +491,8 @@ def run_dfs_stage_sequence(
     depth: int,
     dataset_name: str,
     resume: bool,
+    show_progress: bool = True,
+    stream_child_output: bool = True,
 ) -> dict[str, int]:
     """Run or resume one database's pre-DFS, DFS, and post-DFS stages."""
 
@@ -431,26 +505,35 @@ def run_dfs_stage_sequence(
                 resume_through_index = index
                 break
 
-    indexed_stages = list(enumerate(stages))
-    for stage_index, stage in _progress(
-        indexed_stages,
-        f"DFS-{depth} {dataset_name} stages",
-        "stage",
-    ):
+    indexed_stages: Iterable[tuple[int, tuple[str, Path, str, Path, str]]] = list(enumerate(stages))
+    if show_progress:
+        indexed_stages = _progress(
+            indexed_stages,
+            f"DFS-{depth} {dataset_name} stages",
+            "stage",
+        )
+    for stage_index, stage in indexed_stages:
         stage_name, stage_input, preprocess_name, stage_output, config_file = stage
         if resume and stage_index <= resume_through_index:
             stages_skipped += 1
-            _status(f"[resume] DFS-{depth} {dataset_name}: {stage_name} checkpoint available; skipping")
+            _status(
+                f"[resume] DFS-{depth} {dataset_name}: {stage_name} checkpoint available; skipping",
+                console=stream_child_output,
+            )
             continue
         if resume:
             complete, reason = dbinfer_dataset_is_complete(stage_output)
             if complete:
                 stages_skipped += 1
-                _status(f"[resume] DFS-{depth} {dataset_name}: {stage_name} complete; skipping")
+                _status(
+                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} complete; skipping",
+                    console=stream_child_output,
+                )
                 continue
             if stage_output.exists() or stage_output.is_symlink():
                 _status(
-                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} incomplete ({reason}); rebuilding"
+                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} incomplete ({reason}); rebuilding",
+                    console=stream_child_output,
                 )
                 remove_incomplete_stage_output(stage_output, allowed_root=dfs_workspace_root)
 
@@ -461,13 +544,17 @@ def run_dfs_stage_sequence(
                 f"input {stage_input} is incomplete ({input_reason})."
             )
 
-        _status(f"DFS-{depth} {dataset_name}: {stage_name}")
+        _status(
+            f"DFS-{depth} {dataset_name}: {stage_name}",
+            console=stream_child_output,
+        )
         run_tab2graph_preprocess(
             data_preprocessing_dir,
             stage_input,
             preprocess_name,
             stage_output,
             config_file,
+            stream_output=stream_child_output,
         )
         output_complete, output_reason = dbinfer_dataset_is_complete(stage_output)
         if not output_complete:
@@ -632,6 +719,7 @@ def run_tab2graph_preprocess(
     preprocess_name: str,
     output_path: Path,
     config_path: str,
+    stream_output: bool = True,
 ) -> None:
     cmd = [
         sys.executable,
@@ -645,7 +733,7 @@ def run_tab2graph_preprocess(
         "-c",
         config_path,
     ]
-    run_command(cmd, cwd=data_preprocessing_dir)
+    run_command(cmd, cwd=data_preprocessing_dir, stream_output=stream_output)
 
 
 def discover_dbinfer_datasets(root: Path) -> list[Path]:
@@ -654,13 +742,13 @@ def discover_dbinfer_datasets(root: Path) -> list[Path]:
     return [path for path in sorted(root.iterdir()) if path.is_dir() and (path / "metadata.yaml").exists()]
 
 
-def run_command(cmd: Sequence[Any], cwd: Path) -> None:
-    """Run a child command and tee its combined output to terminal and log."""
+def run_command(cmd: Sequence[Any], cwd: Path, stream_output: bool = True) -> None:
+    """Run a child command, always logging output and optionally streaming it."""
 
     command = [str(part) for part in cmd]
     printable = shlex.join(command)
     started_at = time.perf_counter()
-    _status(f"[run] cwd={cwd} command={printable}")
+    _status(f"[run] cwd={cwd} command={printable}", console=stream_output)
 
     process = subprocess.Popen(
         command,
@@ -679,15 +767,17 @@ def run_command(cmd: Sequence[Any], cwd: Path) -> None:
                     break
                 text = decoder.decode(chunk)
                 if text:
-                    _write_raw_console(text)
+                    if stream_output:
+                        _write_raw_console(text)
                     log_buffer = _log_child_lines(log_buffer, text)
         final_text = decoder.decode(b"", final=True)
         if final_text:
-            _write_raw_console(final_text)
+            if stream_output:
+                _write_raw_console(final_text)
             log_buffer = _log_child_lines(log_buffer, final_text)
         if log_buffer:
             _LOGGER.info("[child] %s", _last_progress_value(log_buffer))
-            if not log_buffer.endswith(("\n", "\r")):
+            if stream_output and not log_buffer.endswith(("\n", "\r")):
                 _write_raw_console("\n")
         return_code = process.wait()
     except BaseException:
@@ -706,7 +796,7 @@ def run_command(cmd: Sequence[Any], cwd: Path) -> None:
             level=logging.ERROR,
         )
         raise subprocess.CalledProcessError(return_code, command)
-    _status(f"[done] elapsed={elapsed:.2f}s command={printable}")
+    _status(f"[done] elapsed={elapsed:.2f}s command={printable}", console=stream_output)
 
 
 def _log_child_lines(buffer: str, text: str) -> str:
@@ -728,15 +818,65 @@ def _last_progress_value(value: str) -> str:
     return ""
 
 
-def _progress(iterable: Iterable[T], desc: str, unit: str) -> Iterable[T]:
+def bounded_parallel_map(
+    func: Callable[[T], R],
+    iterable: Iterable[T],
+    *,
+    max_workers: int,
+) -> Iterable[R]:
+    """Map with at most ``max_workers`` submitted futures at any time."""
+
+    if max_workers < 1:
+        raise ValueError(f"max_workers must be at least 1, got {max_workers}.")
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="dfs-db")
+    pending: set[Future[R]] = set()
+    items = iter(iterable)
+    try:
+        for _ in range(max_workers):
+            try:
+                pending.add(executor.submit(func, next(items)))
+            except StopIteration:
+                break
+
+        while pending:
+            done, still_pending = wait(pending, return_when=FIRST_COMPLETED)
+            pending = set(still_pending)
+            for future in done:
+                result = future.result()
+                try:
+                    pending.add(executor.submit(func, next(items)))
+                except StopIteration:
+                    pass
+                yield result
+    finally:
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _progress(
+    iterable: Iterable[T],
+    desc: str,
+    unit: str,
+    total: int | None = None,
+) -> Iterable[T]:
     if tqdm is None:
         return iterable
-    return tqdm(iterable, desc=desc, unit=unit, ascii=True, file=sys.stdout, dynamic_ncols=True)
+    return tqdm(
+        iterable,
+        desc=desc,
+        unit=unit,
+        total=total,
+        ascii=True,
+        file=sys.stdout,
+        dynamic_ncols=True,
+    )
 
 
-def _status(message: str, level: int = logging.INFO) -> None:
+def _status(message: str, level: int = logging.INFO, *, console: bool = True) -> None:
     _LOGGER.log(level, message)
-    _write_console(message)
+    if console:
+        _write_console(message)
 
 
 def _write_console(message: str) -> None:
@@ -763,6 +903,13 @@ def resolve_project_path(path: Any, project_root: Path) -> Path:
     if value.is_absolute():
         return value
     return (project_root / value).resolve()
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
 
 
 if __name__ == "__main__":

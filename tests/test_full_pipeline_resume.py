@@ -69,8 +69,17 @@ class FullPipelineResumeTests(unittest.TestCase):
                 json.dumps(report), encoding="utf-8"
             )
 
-            datasets = load_resume_dbinfer_datasets(dbinfer_root)
+            with mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline._progress",
+                side_effect=lambda iterable, _desc, _unit: iterable,
+            ) as progress:
+                datasets = load_resume_dbinfer_datasets(dbinfer_root)
+
             self.assertEqual([dataset_dir], datasets)
+            progress.assert_called_once()
+            _, description, unit = progress.call_args.args
+            self.assertEqual("Validating DBInfer datasets", description)
+            self.assertEqual("db", unit)
 
     def test_resume_skips_complete_stage_and_rebuilds_incomplete_stage(self):
         with tempfile.TemporaryDirectory() as tmp:

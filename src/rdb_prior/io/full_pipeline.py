@@ -496,7 +496,7 @@ def load_resume_dbinfer_datasets(root: Path) -> list[Path]:
     dataset_dirs: list[Path] = []
     incomplete: list[str] = []
     seen_names: set[str] = set()
-    for item in exported_items:
+    for item in _progress(exported_items, "Validating DBInfer datasets", "db"):
         dataset_name = Path(str(item["output_dir"])).name
         if dataset_name in seen_names:
             incomplete.append(f"duplicate dataset name {dataset_name!r}")

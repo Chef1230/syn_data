@@ -103,6 +103,7 @@ class PipelineLoggingTests(unittest.TestCase):
                 "DEBUG",
                 "--no-file-log",
                 "--resume-dfs",
+                "--skip-dbinfer-validation",
                 "--dbinfer-root",
                 "outputs/dbinfer_for_dfs/syn_v1",
             ]
@@ -111,6 +112,7 @@ class PipelineLoggingTests(unittest.TestCase):
         self.assertEqual("DEBUG", args.log_level)
         self.assertTrue(args.no_file_log)
         self.assertTrue(args.resume_dfs)
+        self.assertTrue(args.skip_dbinfer_validation)
         self.assertEqual(Path("outputs/dbinfer_for_dfs/syn_v1"), args.dbinfer_root)
 
 

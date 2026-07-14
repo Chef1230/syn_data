@@ -54,6 +54,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Resume DFS from complete DBInfer/stage outputs and rerun only incomplete work.",
     )
+    parser.add_argument(
+        "--skip-dbinfer-validation",
+        action="store_true",
+        help=(
+            "With --resume-dfs, trust export_report.json and skip the per-dataset "
+            "DBInfer metadata/table/task file validation."
+        ),
+    )
     parser.add_argument("--dfs-h5-output-dir", type=Path, default=None, help="Override dfs_export.h5_output_dir.")
     parser.add_argument("--log-file", type=Path, default=None, help="Override logging.file.")
     parser.add_argument(
@@ -187,6 +195,7 @@ def execute_pipeline(
             dbinfer_root_override=args.dbinfer_root,
             h5_output_dir_override=args.dfs_h5_output_dir,
             resume=args.resume_dfs,
+            skip_dbinfer_validation=args.skip_dbinfer_validation,
         )
     else:
         _status("DFS export stage skipped")
@@ -246,6 +255,7 @@ def run_dfs_exports(
     dbinfer_root_override: Path | None = None,
     h5_output_dir_override: Path | None = None,
     resume: bool = False,
+    skip_dbinfer_validation: bool = False,
 ) -> dict[str, Any]:
     dfs_cfg = dict(config.get("dfs_export", {}))
     dbinfer_root = resolve_project_path(
@@ -273,7 +283,15 @@ def run_dfs_exports(
 
     if resume:
         _status(f"[resume] Reusing DBInfer root without export: {dbinfer_root}")
-        dataset_dirs = load_resume_dbinfer_datasets(dbinfer_root)
+        if skip_dbinfer_validation:
+            _status(
+                "[resume] Skipping per-dataset DBInfer content validation; "
+                "trusting export_report.json"
+            )
+        dataset_dirs = load_resume_dbinfer_datasets(
+            dbinfer_root,
+            validate_datasets=not skip_dbinfer_validation,
+        )
         dbinfer_mode = "reused"
     else:
         export_cmd = [
@@ -389,6 +407,7 @@ def run_dfs_exports(
         "num_dbinfer_datasets": len(dataset_dirs),
         "workspace_root": str(dfs_workspace_root),
         "resume": resume,
+        "dbinfer_validation_skipped": bool(resume and skip_dbinfer_validation),
         "depths": depth_reports,
     }
 
@@ -460,14 +479,19 @@ def run_dfs_stage_sequence(
     return {"stages_run": stages_run, "stages_skipped": stages_skipped}
 
 
-def load_resume_dbinfer_datasets(root: Path) -> list[Path]:
+def load_resume_dbinfer_datasets(
+    root: Path,
+    *,
+    validate_datasets: bool = True,
+) -> list[Path]:
     """Load and validate the exact DBInfer export represented by ``root``."""
 
     root = root.resolve()
     if (root / "metadata.yaml").exists():
-        complete, reason = dbinfer_dataset_is_complete(root)
-        if not complete:
-            raise RuntimeError(f"Cannot resume from incomplete DBInfer dataset {root}: {reason}")
+        if validate_datasets:
+            complete, reason = dbinfer_dataset_is_complete(root)
+            if not complete:
+                raise RuntimeError(f"Cannot resume from incomplete DBInfer dataset {root}: {reason}")
         return [root]
 
     report_path = root / "export_report.json"
@@ -496,13 +520,21 @@ def load_resume_dbinfer_datasets(root: Path) -> list[Path]:
     dataset_dirs: list[Path] = []
     incomplete: list[str] = []
     seen_names: set[str] = set()
-    for item in _progress(exported_items, "Validating DBInfer datasets", "db"):
+    items = (
+        _progress(exported_items, "Validating DBInfer datasets", "db")
+        if validate_datasets
+        else exported_items
+    )
+    for item in items:
         dataset_name = Path(str(item["output_dir"])).name
         if dataset_name in seen_names:
             incomplete.append(f"duplicate dataset name {dataset_name!r}")
             continue
         seen_names.add(dataset_name)
         dataset_dir = root / dataset_name
+        if not validate_datasets:
+            dataset_dirs.append(dataset_dir)
+            continue
         complete, reason = dbinfer_dataset_is_complete(dataset_dir)
         if complete:
             dataset_dirs.append(dataset_dir)

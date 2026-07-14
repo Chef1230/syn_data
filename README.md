@@ -38,7 +38,8 @@ RDB_PRIOR_LOG_LEVEL=DEBUG RDB_PRIOR_LOG_FILE=outputs/logs/debug_pipeline.log \
 # Resume only the DFS stage, reusing the exact existing DBInfer root.
 bash syn_data/scripts/run_full_pipeline.sh configs/v1.yaml \
   --skip-generation --skip-rdbpfn-export \
-  --resume-dfs --dbinfer-root outputs/dbinfer_for_dfs/syn_v1
+  --resume-dfs --skip-dbinfer-validation \
+  --dbinfer-root outputs/dbinfer_for_dfs/syn_v1
 ```
 
 ## Main configuration
@@ -58,6 +59,7 @@ Edit `configs/default.yaml` for the normal pipeline:
 - `dfs_export.depths`: DFS depths to export; current training config keeps `[1, 2]`.
 - `--dbinfer-root`: overrides `dfs_export.dbinfer_output_root` for both normal and resumed DFS runs.
 - `--resume-dfs`: enables DFS for the run, reuses that DBInfer root, skips complete pre/DFS/post outputs, and rebuilds only incomplete stages.
+- `--skip-dbinfer-validation`: with `--resume-dfs`, trusts `export_report.json` and skips the slow per-dataset metadata/table/task file validation. Corrupt datasets will instead fail when DFS reaches them.
 
 `--resume-dfs` requires the original `export_report.json` under `--dbinfer-root`.
 The same config must retain the original `dfs_export.workspace_root`, because

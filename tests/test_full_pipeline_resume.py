@@ -81,6 +81,37 @@ class FullPipelineResumeTests(unittest.TestCase):
             self.assertEqual("Validating DBInfer datasets", description)
             self.assertEqual("db", unit)
 
+    def test_resume_can_skip_per_dataset_dbinfer_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dbinfer_root = Path(tmp) / "kept_dbinfer_root"
+            dbinfer_root.mkdir()
+            report = {
+                "num_exported": 1,
+                "items": [
+                    {
+                        "output_dir": "/old/dbinfer/root/db_000000",
+                        "status": "exported",
+                    }
+                ],
+            }
+            (dbinfer_root / "export_report.json").write_text(
+                json.dumps(report), encoding="utf-8"
+            )
+
+            with mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.dbinfer_dataset_is_complete"
+            ) as completeness, mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline._progress"
+            ) as progress:
+                datasets = load_resume_dbinfer_datasets(
+                    dbinfer_root,
+                    validate_datasets=False,
+                )
+
+            self.assertEqual([dbinfer_root / "db_000000"], datasets)
+            completeness.assert_not_called()
+            progress.assert_not_called()
+
     def test_resume_skips_complete_stage_and_rebuilds_incomplete_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -1,0 +1,31 @@
+# Schema-only reference fragment. The main scripts read configs/default.yaml.
+schema:
+  min_tables: 3
+  max_tables: 15
+  table_count_values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  table_count_weights: [0.20, 0.12, 0.16, 0.14, 0.12, 0.10, 0.06, 0.03, 0.02, 0.02, 0.015, 0.005, 0.01]
+  feature_columns_by_table_count:
+    - table_count_min: 3
+      table_count_max: 5
+      min_columns: 6
+      max_columns: 15
+    - table_count_min: 6
+      table_count_max: 8
+      min_columns: 4
+      max_columns: 10
+    - table_count_min: 9
+      table_count_max: 12
+      min_columns: 3
+      max_columns: 8
+    - table_count_min: 13
+      table_count_max: 15
+      min_columns: 2
+      max_columns: 6
+  max_depth: 3
+  schema_depth_values: [1, 2, 3]
+  schema_depth_weights: [0.25, 0.50, 0.25]
+  require_bridge_parents: true
+  min_bridge_parents: 2
+  require_connected: true
+  require_entity: true
+  require_event: true

@@ -1,0 +1,106 @@
+# Main one-click pipeline config for syn_data.
+# Scripts read this file by default; override with RDB_PRIOR_CONFIG or the first script argument.
+seed: 42
+
+paths:
+  # Relative paths are resolved from the syn_data project directory.
+  database_output_root: outputs/databases/sample_50
+
+generation:
+  num_databases: 50
+  # Worker processes used by syn_data.src.rdb_prior.io.generate_parallel.
+  num_workers: 4
+  schema_id_prefix: db
+  start_time: "2020-01-01"
+  end_time: "2022-01-01"
+  cutoff_time: null
+  future_window_days: 30
+  history_window_days: 365
+  enable_leakage_guard: true
+  # Keep sample DBs small while preserving schema-level role row-count priors.
+  row_scale: 0.001
+  max_rows_per_table: 500
+
+schema:
+  min_tables: 3
+  max_tables: 15
+  table_count_values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  table_count_weights: [0.20, 0.12, 0.16, 0.14, 0.12, 0.10, 0.06, 0.03, 0.02, 0.02, 0.015, 0.005, 0.01]
+  feature_columns_by_table_count:
+    - table_count_min: 3
+      table_count_max: 5
+      min_columns: 6
+      max_columns: 15
+    - table_count_min: 6
+      table_count_max: 8
+      min_columns: 4
+      max_columns: 10
+    - table_count_min: 9
+      table_count_max: 12
+      min_columns: 3
+      max_columns: 8
+    - table_count_min: 13
+      table_count_max: 15
+      min_columns: 2
+      max_columns: 6
+  max_depth: 3
+  schema_depth_values: [1, 2, 3]
+  schema_depth_weights: [0.25, 0.50, 0.25]
+  min_edge_density: 0.8
+  max_edge_density: 1.4
+  min_motifs: 1
+  max_motifs: 4
+  max_motif_rank_span: 3
+  require_connected: true
+  allow_rank_skip_edges: true
+  allow_parallel_fk: false
+  require_entity: true
+  require_event: true
+  max_outcome_tables: 1
+  require_bridge_parents: true
+  min_bridge_parents: 2
+  add_random_edges: true
+  max_edge_attempts: 300
+  enable_motif_edges: true
+  enable_transition_check: true
+  strict_transition_check: false
+
+task:
+  enabled: true
+  # null means auto priority: outcome -> summary -> entity -> event.
+  # Set to outcome/entity/event/summary to force one task source role.
+  target_source_role: null
+  target_source_table: null
+  positive_rate: 0.35
+  fail_on_error: true
+
+rdbpfn_export:
+  # run_full_pipeline.sh exports this HDF5 when h5py is installed.
+  enabled: true
+  output_path: ../RDB_PFN/model_pretrain/pretrain_datasets/syn_role_tasks.h5
+  total_rows: 256
+  max_columns: 128
+  include_val_as_query: true
+  compression: lzf
+
+# Optional DFS-based export through RDB_PFN/data_preprocessing.
+# Keep disabled for the small default smoke config because DFS can be slow.
+dfs_export:
+  enabled: false
+  depths: [1, 2]
+  rdb_pfn_root: ../RDB_PFN
+  dbinfer_output_root: outputs/dbinfer_for_dfs/sample_50
+  workspace_root: outputs/dfs_workspace/sample_50
+  h5_output_dir: ../RDB_PFN/model_pretrain/pretrain_datasets
+  unsampled_h5_name_template: syn_role_dfs_{depth}_unsampled.h5
+  h5_name_template: syn_role_dfs_{depth}.h5
+  total_rows: 256
+  max_columns: 128
+  min_train_ratio: 0.5
+  max_train_ratio: 0.9
+  filter:
+    enabled: true
+    sampled_columns: 30
+    max_expected_columns: 10
+    ratio: 0.9
+    safety_factor: 1.0

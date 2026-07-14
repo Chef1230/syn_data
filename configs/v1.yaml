@@ -1,0 +1,110 @@
+# Training database generation config for syn_v1.
+# Use this with:
+#   bash syn_data/scripts/run_full_pipeline.sh syn_data/configs/v1.yaml
+seed: 42
+
+paths:
+  # Relative paths are resolved from the syn_data project directory.
+  database_output_root: outputs/databases/syn_v1
+
+generation:
+  # One generated DB/task bundle becomes one RDBPFN episode in the exported H5.
+  num_databases: 10000
+  # Worker processes used by syn_data.src.rdb_prior.io.generate_parallel.
+  num_workers: 8
+  schema_id_prefix: syn_v1_db
+  start_time: "2020-01-01"
+  end_time: "2022-01-01"
+  cutoff_time: null
+  future_window_days: 30
+  history_window_days: 365
+  enable_leakage_guard: true
+
+  # Training-size setting. With current schema row priors this yields roughly:
+  # entity ~= 500 rows, event ~= 250-500 rows, bridge/summary up to 2500 rows.
+  # This keeps most task labels above the 256-row RDBPFN episode length while
+  # avoiding full-scale raw RDB dumps for v1.
+  row_scale: 1.0
+  max_rows_per_table: null
+
+schema:
+  min_tables: 3
+  max_tables: 15
+  table_count_values: [3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+  table_count_weights: [0.20, 0.12, 0.16, 0.14, 0.12, 0.10, 0.06, 0.03, 0.02, 0.02, 0.015, 0.005, 0.01]
+  feature_columns_by_table_count:
+    - table_count_min: 3
+      table_count_max: 5
+      min_columns: 6
+      max_columns: 15
+    - table_count_min: 6
+      table_count_max: 8
+      min_columns: 4
+      max_columns: 10
+    - table_count_min: 9
+      table_count_max: 12
+      min_columns: 3
+      max_columns: 8
+    - table_count_min: 13
+      table_count_max: 15
+      min_columns: 2
+      max_columns: 6
+  max_depth: 3
+  schema_depth_values: [1, 2, 3]
+  schema_depth_weights: [0.25, 0.50, 0.25]
+  min_edge_density: 0.8
+  max_edge_density: 1.4
+  min_motifs: 1
+  max_motifs: 4
+  max_motif_rank_span: 3
+  require_connected: true
+  allow_rank_skip_edges: true
+  allow_parallel_fk: false
+  require_entity: true
+  require_event: true
+  max_outcome_tables: 1
+  require_bridge_parents: true
+  min_bridge_parents: 2
+  add_random_edges: true
+  max_edge_attempts: 300
+  enable_motif_edges: true
+  enable_transition_check: true
+  strict_transition_check: false
+
+task:
+  enabled: true
+  # null means auto priority: outcome -> summary -> entity -> event.
+  target_source_role: null
+  target_source_table: null
+  positive_rate: 0.35
+  fail_on_error: true
+
+rdbpfn_export:
+  enabled: true
+  output_path: ../RDB_PFN/model_pretrain/pretrain_datasets/syn_v1_tasks.h5
+  total_rows: 256
+  max_columns: 128
+  include_val_as_query: true
+  compression: lzf
+
+# DFS-based relational exports for RDBPFN pretraining.
+# This keeps 1-hop and 2-hop feature synthesis versions.
+dfs_export:
+  enabled: true
+  depths: [1, 2]
+  rdb_pfn_root: ../RDB_PFN
+  dbinfer_output_root: outputs/dbinfer_for_dfs/syn_v1
+  workspace_root: outputs/dfs_workspace/syn_v1
+  h5_output_dir: ../RDB_PFN/model_pretrain/pretrain_datasets
+  unsampled_h5_name_template: syn_v1_dfs_{depth}_unsampled.h5
+  h5_name_template: syn_v1_dfs_{depth}.h5
+  total_rows: 256
+  max_columns: 128
+  min_train_ratio: 0.5
+  max_train_ratio: 0.9
+  filter:
+    enabled: true
+    sampled_columns: 30
+    max_expected_columns: 10
+    ratio: 0.9
+    safety_factor: 1.0

@@ -1,0 +1,15 @@
+# Task-only reference fragment. The main scripts read configs/default.yaml.
+task:
+  enabled: true
+  target_source_role: null
+  target_source_table: null
+  positive_rate: 0.35
+  fail_on_error: true
+
+rdbpfn_export:
+  enabled: true
+  output_path: ../RDB_PFN/model_pretrain/pretrain_datasets/syn_role_tasks.h5
+  total_rows: 256
+  max_columns: 128
+  include_val_as_query: true
+  compression: lzf

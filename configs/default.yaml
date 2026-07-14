@@ -6,6 +6,15 @@ paths:
   # Relative paths are resolved from the syn_data project directory.
   database_output_root: outputs/databases/sample_50
 
+logging:
+  # run_full_pipeline.sh keeps terminal output and writes all stage/subprocess
+  # output to this rotating UTF-8 log.
+  enabled: true
+  level: INFO
+  file: outputs/logs/full_pipeline.log
+  max_bytes: 52428800
+  backup_count: 5
+
 generation:
   num_databases: 50
   schema_id_prefix: db

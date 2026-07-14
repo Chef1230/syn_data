@@ -8,9 +8,12 @@ paths:
   database_output_root: outputs/databases/syn_v1
 
 logging:
-  # Command-line --log-level/--log-file overrides these defaults.
+  # Command-line --log-level/--log-file and RDB_PRIOR_LOG_* override these defaults.
+  enabled: true
   level: INFO
   file: outputs/logs/syn_v1_pipeline.log
+  max_bytes: 52428800
+  backup_count: 5
 
 generation:
   # One generated DB/task bundle becomes one RDBPFN episode in the exported H5.

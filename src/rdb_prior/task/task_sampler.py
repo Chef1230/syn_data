@@ -6,9 +6,10 @@ structure and it does not interpret FK edges as causal edges.
 
 from __future__ import annotations
 
+import random
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional, Sequence
-import uuid
 
 import pandas as pd
 
@@ -116,6 +117,112 @@ class TaskSampler:
             target_source_role=target_source_role,
             target_source_table=target_source_table,
         )
+        return self._build_task_spec(
+            schema=schema,
+            tables=tables,
+            metadata=metadata,
+            nodes=nodes,
+            table_metadata=table_metadata,
+            target_table=target_table,
+        )
+
+    def sample_tasks(
+        self,
+        schema: SchemaLike,
+        tables: Mapping[str, pd.DataFrame],
+        metadata: Mapping[str, Any],
+        target_source_role: Optional[str] = None,
+        target_source_table: Optional[str] = None,
+        min_tasks: int = 1,
+        max_tasks: int = 3,
+    ) -> list[TaskSpec]:
+        """Sample one to three distinct task specifications for a database.
+
+        The legacy highest-priority task remains first. Additional task source
+        tables are sampled without replacement using ``seed``.
+        """
+        task_count, candidates = self.plan_tasks(
+            schema=schema,
+            tables=tables,
+            metadata=metadata,
+            target_source_role=target_source_role,
+            target_source_table=target_source_table,
+            min_tasks=min_tasks,
+            max_tasks=max_tasks,
+        )
+        return candidates[:task_count]
+
+    def plan_tasks(
+        self,
+        schema: SchemaLike,
+        tables: Mapping[str, pd.DataFrame],
+        metadata: Mapping[str, Any],
+        target_source_role: Optional[str] = None,
+        target_source_table: Optional[str] = None,
+        min_tasks: int = 1,
+        max_tasks: int = 3,
+    ) -> tuple[int, list[TaskSpec]]:
+        """Return the sampled task count and an ordered fallback candidate list."""
+        min_tasks = int(min_tasks)
+        max_tasks = int(max_tasks)
+        if min_tasks < 1:
+            raise ValueError("min_tasks must be at least 1.")
+        if max_tasks < min_tasks:
+            raise ValueError("max_tasks must be greater than or equal to min_tasks.")
+        if max_tasks > 3:
+            raise ValueError("max_tasks must not exceed 3.")
+
+        nodes = schema_nodes(schema)
+        table_metadata = self._table_metadata(metadata)
+        target_tables = self._candidate_target_tables(
+            nodes=nodes,
+            tables=tables,
+            metadata=table_metadata,
+            target_source_role=target_source_role,
+            target_source_table=target_source_table,
+        )
+
+        candidates: list[TaskSpec] = []
+        for target_table in target_tables:
+            try:
+                candidates.append(
+                    self._build_task_spec(
+                        schema=schema,
+                        tables=tables,
+                        metadata=metadata,
+                        nodes=nodes,
+                        table_metadata=table_metadata,
+                        target_table=target_table,
+                    )
+                )
+            except ValueError:
+                if target_source_table is not None:
+                    raise
+
+        if len(candidates) < min_tasks:
+            raise ValueError(
+                f"Only {len(candidates)} task candidates are available, "
+                f"but min_tasks={min_tasks}."
+            )
+
+        rng = random.Random(self.seed)
+        task_count = rng.randint(min_tasks, min(max_tasks, len(candidates)))
+        if len(candidates) > 1:
+            primary = candidates[0]
+            remaining = candidates[1:]
+            rng.shuffle(remaining)
+            candidates = [primary, *remaining]
+        return task_count, candidates
+
+    def _build_task_spec(
+        self,
+        schema: SchemaLike,
+        tables: Mapping[str, pd.DataFrame],
+        metadata: Mapping[str, Any],
+        nodes: Mapping[str, Any],
+        table_metadata: Mapping[str, Mapping[str, Any]],
+        target_table: str,
+    ) -> TaskSpec:
         target_node = nodes[target_table]
         target_role = self._table_role(target_table, nodes, table_metadata)
         target_pk = node_primary_key(target_node)
@@ -126,6 +233,7 @@ class TaskSampler:
                 schema=schema,
                 nodes=nodes,
                 table_metadata=table_metadata,
+                tables=tables,
                 outcome_table=target_table,
             )
             label_col = self._label_column(target_node, tables[target_table], table_metadata.get(target_table, {}))
@@ -157,6 +265,44 @@ class TaskSampler:
             target_fk_col=target_fk_col,
             target_time_col=target_time_col,
         )
+
+    def _candidate_target_tables(
+        self,
+        nodes: Mapping[str, Any],
+        tables: Mapping[str, pd.DataFrame],
+        metadata: Mapping[str, Mapping[str, Any]],
+        target_source_role: Optional[str],
+        target_source_table: Optional[str],
+    ) -> list[str]:
+        if target_source_table is not None:
+            return [
+                self._choose_target_table(
+                    nodes=nodes,
+                    tables=tables,
+                    metadata=metadata,
+                    target_source_role=target_source_role,
+                    target_source_table=target_source_table,
+                )
+            ]
+
+        requested_role = str(target_source_role) if target_source_role is not None else None
+        if requested_role is not None and requested_role not in SUPPORTED_TARGET_ROLES:
+            raise ValueError(
+                f"target_source_role must be one of {SUPPORTED_TARGET_ROLES}, got {requested_role!r}."
+            )
+
+        role_order: Sequence[str] = (requested_role,) if requested_role else DEFAULT_TARGET_ROLE_PRIORITY
+        candidates = [
+            table_id
+            for role in role_order
+            for table_id in sorted(tables)
+            if table_id in nodes and self._table_role(table_id, nodes, metadata) == role
+        ]
+        if candidates:
+            return candidates
+
+        detail = f"role={requested_role!r}" if requested_role else f"roles={DEFAULT_TARGET_ROLE_PRIORITY!r}"
+        raise ValueError(f"No generated table found for supported task target source {detail}.")
 
     def _choose_target_table(
         self,
@@ -203,6 +349,7 @@ class TaskSampler:
         schema: SchemaLike,
         nodes: Mapping[str, Any],
         table_metadata: Mapping[str, Mapping[str, Any]],
+        tables: Mapping[str, pd.DataFrame],
         outcome_table: str,
     ) -> tuple[str, str, str]:
         fks = foreign_keys_for_child(schema, outcome_table)
@@ -212,16 +359,51 @@ class TaskSampler:
             )
 
         role_priority = {"summary": 0, "entity": 1, "event": 2, "bridge": 3, "context": 4, "class": 5}
-        ranked = sorted(
-            fks,
-            key=lambda fk: (
-                role_priority.get(self._table_role(fk_parent_table(fk), nodes, table_metadata), 99),
-                fk_parent_table(fk),
-            ),
-        )
-        chosen = ranked[0]
+        ranked = []
+        for fk in fks:
+            prediction_units = self._count_outcome_prediction_units(
+                fk=fk,
+                tables=tables,
+                outcome_table=outcome_table,
+            )
+            ranked.append(
+                (
+                    prediction_units,
+                    role_priority.get(self._table_role(fk_parent_table(fk), nodes, table_metadata), 99),
+                    fk_parent_table(fk),
+                    fk,
+                )
+            )
+
+        viable = [item for item in ranked if item[0] >= 2]
+        if viable:
+            chosen = sorted(viable, key=lambda item: (-item[0], item[1], item[2]))[0][3]
+        else:
+            chosen = sorted(ranked, key=lambda item: (-item[0], item[1], item[2]))[0][3]
         parent_table = fk_parent_table(chosen)
         return parent_table, fk_parent_col(chosen), fk_child_col(chosen)
+
+    @staticmethod
+    def _count_outcome_prediction_units(
+        fk: Any,
+        tables: Mapping[str, pd.DataFrame],
+        outcome_table: str,
+    ) -> int:
+        outcome_df = tables.get(outcome_table)
+        parent_df = tables.get(fk_parent_table(fk))
+        child_col = fk_child_col(fk)
+        parent_col = fk_parent_col(fk)
+        if outcome_df is None or parent_df is None:
+            return 0
+        if child_col not in outcome_df.columns or parent_col not in parent_df.columns:
+            return 0
+        values = outcome_df[child_col].dropna()
+        if values.empty:
+            return 0
+        parent_values = parent_df[parent_col].dropna()
+        if not parent_values.empty:
+            values = values[values.isin(parent_values)]
+        return int(values.nunique(dropna=True))
 
     @staticmethod
     def _table_metadata(metadata: Mapping[str, Any]) -> Dict[str, Mapping[str, Any]]:

@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import threading
@@ -16,7 +17,9 @@ from syn_data.src.rdb_prior.io.full_pipeline import (
     dbinfer_dataset_is_complete,
     load_resume_dbinfer_datasets,
     remove_incomplete_stage_output,
+    run_dfs_exports,
     run_dfs_stage_sequence,
+    run_one_dfs_dataset,
 )
 
 
@@ -223,6 +226,174 @@ class FullPipelineResumeTests(unittest.TestCase):
             self.assertEqual(1, preprocess.call_count)
             self.assertFalse(pre_dir.exists())
             self.assertTrue(dbinfer_dataset_is_complete(processed_dir)[0])
+
+    def test_one_dataset_failure_is_returned_instead_of_raised(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset_dir = root / "dbinfer" / "db_failed"
+            workspace = root / "dfs_workspace"
+            _write_complete_dataset(dataset_dir, dataset_name="db_failed")
+
+            def fake_preprocess(_tool_root, _input, name, output, _config, **_kwargs):
+                if name == "dfs":
+                    raise subprocess.CalledProcessError(1, ["tab2graph", "dfs"])
+                _write_complete_dataset(Path(output), dataset_name="db_failed")
+
+            with mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.run_tab2graph_preprocess",
+                side_effect=fake_preprocess,
+            ):
+                report = run_one_dfs_dataset(
+                    dataset_dir,
+                    processed_root=workspace / "dfs_1" / "processed",
+                    pre_root=workspace / "dfs_1" / "pre",
+                    post_root=workspace / "dfs_1" / "post",
+                    data_preprocessing_dir=root / "RDBPFN" / "data_preprocessing",
+                    dfs_workspace_root=workspace,
+                    depth=1,
+                    resume=False,
+                    stream_child_output=False,
+                )
+
+            self.assertEqual("failed", report["status"])
+            self.assertEqual(1, report["stages_run"])
+            self.assertEqual("dfs", report["failure"]["stage"])
+            self.assertEqual("CalledProcessError", report["failure"]["error_type"])
+            self.assertEqual(1, report["failure"]["return_code"])
+            self.assertEqual(["tab2graph", "dfs"], report["failure"]["command"])
+
+    def test_dfs_export_continues_and_writes_failed_dataset_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rdb_pfn_root = root / "RDBPFN"
+            (rdb_pfn_root / "data_preprocessing").mkdir(parents=True)
+            dbinfer_root = root / "dbinfer"
+            good = dbinfer_root / "db_good"
+            failed = dbinfer_root / "db_failed"
+            h5_output = root / "h5"
+            failure = {
+                "dataset_name": "db_failed",
+                "dataset_dir": str(failed),
+                "depth": 1,
+                "stage": "dfs",
+                "error_type": "RuntimeError",
+                "error": "No feature to compute",
+            }
+
+            def fake_run_one(dataset_dir, **_kwargs):
+                if dataset_dir.name == "db_failed":
+                    return {
+                        "status": "failed",
+                        "dataset_name": dataset_dir.name,
+                        "stages_run": 1,
+                        "stages_skipped": 0,
+                        "datasets_skipped_as_complete": 0,
+                        "failure": failure,
+                    }
+                return {
+                    "status": "succeeded",
+                    "dataset_name": dataset_dir.name,
+                    "stages_run": 3,
+                    "stages_skipped": 0,
+                    "datasets_skipped_as_complete": 0,
+                }
+
+            config = {
+                "dfs_export": {
+                    "workspace_root": "dfs_workspace",
+                    "filter": {"enabled": False},
+                }
+            }
+            with mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.load_resume_dbinfer_datasets",
+                return_value=[failed, good],
+            ), mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.run_one_dfs_dataset",
+                side_effect=fake_run_one,
+            ), mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.run_command"
+            ) as run_command, mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline._progress",
+                side_effect=lambda iterable, *_args, **_kwargs: iterable,
+            ):
+                report = run_dfs_exports(
+                    config=config,
+                    project_root=root,
+                    workspace_root=root,
+                    database_root=root / "databases",
+                    depths=[1],
+                    rdb_pfn_root_override=rdb_pfn_root,
+                    dbinfer_root_override=dbinfer_root,
+                    h5_output_dir_override=h5_output,
+                    resume=True,
+                    skip_dbinfer_validation=True,
+                    dfs_jobs=1,
+                )
+
+            self.assertEqual(1, report["num_failed_dataset_runs"])
+            self.assertEqual(1, report["num_unique_failed_datasets"])
+            self.assertEqual(1, report["depths"][0]["num_successful_datasets"])
+            self.assertEqual([failure], report["depths"][0]["failed_datasets"])
+            self.assertFalse(report["depths"][0]["h5_merge_skipped"])
+            run_command.assert_called_once()
+
+            failure_report = Path(report["failure_report"])
+            payload = json.loads(failure_report.read_text(encoding="utf-8"))
+            self.assertEqual(1, payload["num_failed_dataset_runs"])
+            self.assertEqual([failure], payload["failed_datasets"])
+
+    def test_dfs_export_skips_h5_merge_when_all_datasets_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rdb_pfn_root = root / "RDBPFN"
+            (rdb_pfn_root / "data_preprocessing").mkdir(parents=True)
+            dataset = root / "dbinfer" / "db_failed"
+            failure = {
+                "dataset_name": "db_failed",
+                "dataset_dir": str(dataset),
+                "depth": 1,
+                "stage": "dfs",
+                "error_type": "RuntimeError",
+                "error": "No feature to compute",
+            }
+            failed_result = {
+                "status": "failed",
+                "dataset_name": "db_failed",
+                "stages_run": 1,
+                "stages_skipped": 0,
+                "datasets_skipped_as_complete": 0,
+                "failure": failure,
+            }
+
+            with mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.load_resume_dbinfer_datasets",
+                return_value=[dataset],
+            ), mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.run_one_dfs_dataset",
+                return_value=failed_result,
+            ), mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline.run_command"
+            ) as run_command, mock.patch(
+                "syn_data.src.rdb_prior.io.full_pipeline._progress",
+                side_effect=lambda iterable, *_args, **_kwargs: iterable,
+            ):
+                report = run_dfs_exports(
+                    config={"dfs_export": {"workspace_root": "dfs_workspace"}},
+                    project_root=root,
+                    workspace_root=root,
+                    database_root=root / "databases",
+                    depths=[1],
+                    rdb_pfn_root_override=rdb_pfn_root,
+                    dbinfer_root_override=root / "dbinfer",
+                    h5_output_dir_override=root / "h5",
+                    resume=True,
+                    skip_dbinfer_validation=True,
+                    dfs_jobs=1,
+                )
+
+            run_command.assert_not_called()
+            self.assertTrue(report["depths"][0]["h5_merge_skipped"])
+            self.assertIsNone(report["depths"][0]["output_h5"])
 
 
 if __name__ == "__main__":

@@ -35,6 +35,31 @@ R = TypeVar("R")
 _LOGGER = get_pipeline_logger()
 
 
+class DFSStageError(RuntimeError):
+    """Attach dataset/stage context to a recoverable per-dataset DFS failure."""
+
+    def __init__(
+        self,
+        *,
+        dataset_name: str,
+        depth: int,
+        stage_name: str,
+        cause: Exception,
+        stages_run: int,
+        stages_skipped: int,
+    ) -> None:
+        self.dataset_name = dataset_name
+        self.depth = depth
+        self.stage_name = stage_name
+        self.cause = cause
+        self.stages_run = stages_run
+        self.stages_skipped = stages_skipped
+        super().__init__(
+            f"DFS-{depth} {dataset_name} {stage_name} failed: "
+            f"{type(cause).__name__}: {cause}"
+        )
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run syn_data generation and exports.")
     parser.add_argument("--config", type=Path, default=Path("syn_data/configs/default.yaml"))
@@ -327,6 +352,7 @@ def run_dfs_exports(
     _status(f"DFS dataset worker limit: {dfs_jobs}")
 
     depth_reports = []
+    all_failed_datasets: list[dict[str, Any]] = []
     for depth in _progress(depths, "DFS export depths", "depth"):
         processed_root = dfs_workspace_root / f"dfs_{depth}" / "processed"
         processed_root.mkdir(parents=True, exist_ok=True)
@@ -335,6 +361,8 @@ def run_dfs_exports(
         stage_run_count = 0
         stage_skip_count = 0
         completed_dataset_skip_count = 0
+        successful_dataset_count = 0
+        failed_datasets: list[dict[str, Any]] = []
         run_one = partial(
             run_one_dfs_dataset,
             processed_root=processed_root,
@@ -367,60 +395,107 @@ def run_dfs_exports(
             stage_run_count += dataset_report["stages_run"]
             stage_skip_count += dataset_report["stages_skipped"]
             completed_dataset_skip_count += dataset_report["datasets_skipped_as_complete"]
+            if dataset_report["status"] == "failed":
+                failed_datasets.append(dataset_report["failure"])
+            else:
+                successful_dataset_count += 1
+
+        all_failed_datasets.extend(failed_datasets)
+        if failed_datasets:
+            _status(
+                f"DFS-{depth}: skipped {len(failed_datasets)} failed datasets; "
+                f"continuing with {successful_dataset_count} successful datasets",
+                level=logging.WARNING,
+            )
 
         unsampled_h5 = h5_output_dir / str(dfs_cfg.get("unsampled_h5_name_template", "syn_dfs_{depth}_unsampled.h5")).format(depth=depth)
         final_h5 = h5_output_dir / str(dfs_cfg.get("h5_name_template", "syn_dfs_{depth}.h5")).format(depth=depth)
-        merge_cmd = [
-            sys.executable,
-            "-u",
-            "merge_dbinfer_to_h5.py",
-            "--dataset-root",
-            str(processed_root),
-            "--output",
-            str(unsampled_h5),
-            "--total-rows",
-            str(int(dfs_cfg.get("total_rows", config.get("rdbpfn_export", {}).get("total_rows", 256)))),
-            "--max-columns",
-            str(int(dfs_cfg.get("max_columns", config.get("rdbpfn_export", {}).get("max_columns", 128)))),
-            "--min-train-ratio",
-            str(float(dfs_cfg.get("min_train_ratio", 0.5))),
-            "--max-train-ratio",
-            str(float(dfs_cfg.get("max_train_ratio", 0.9))),
-        ]
-        run_command(merge_cmd, cwd=data_preprocessing_dir)
-
-        filter_cfg = dict(dfs_cfg.get("filter", {}))
-        if bool(filter_cfg.get("enabled", True)):
-            filter_cmd = [
+        merge_skipped = successful_dataset_count == 0
+        if merge_skipped:
+            _status(
+                f"DFS-{depth}: all datasets failed; H5 merge skipped",
+                level=logging.WARNING,
+            )
+        else:
+            merge_cmd = [
                 sys.executable,
                 "-u",
-                "filter_h5_sampling_columns.py",
+                "merge_dbinfer_to_h5.py",
+                "--dataset-root",
+                str(processed_root),
+                "--output",
                 str(unsampled_h5),
-                str(final_h5),
-                "--sampled-columns",
-                str(int(filter_cfg.get("sampled_columns", 30))),
-                "--max-expected-columns",
-                str(int(filter_cfg.get("max_expected_columns", 10))),
-                "--ratio",
-                str(float(filter_cfg.get("ratio", 0.9))),
-                "--safety-factor",
-                str(float(filter_cfg.get("safety_factor", 1.0))),
+                "--total-rows",
+                str(int(dfs_cfg.get("total_rows", config.get("rdbpfn_export", {}).get("total_rows", 256)))),
+                "--max-columns",
+                str(int(dfs_cfg.get("max_columns", config.get("rdbpfn_export", {}).get("max_columns", 128)))),
+                "--min-train-ratio",
+                str(float(dfs_cfg.get("min_train_ratio", 0.5))),
+                "--max-train-ratio",
+                str(float(dfs_cfg.get("max_train_ratio", 0.9))),
             ]
-            run_command(filter_cmd, cwd=data_preprocessing_dir)
-        else:
-            final_h5 = unsampled_h5
+            run_command(merge_cmd, cwd=data_preprocessing_dir)
+
+            filter_cfg = dict(dfs_cfg.get("filter", {}))
+            if bool(filter_cfg.get("enabled", True)):
+                filter_cmd = [
+                    sys.executable,
+                    "-u",
+                    "filter_h5_sampling_columns.py",
+                    str(unsampled_h5),
+                    str(final_h5),
+                    "--sampled-columns",
+                    str(int(filter_cfg.get("sampled_columns", 30))),
+                    "--max-expected-columns",
+                    str(int(filter_cfg.get("max_expected_columns", 10))),
+                    "--ratio",
+                    str(float(filter_cfg.get("ratio", 0.9))),
+                    "--safety-factor",
+                    str(float(filter_cfg.get("safety_factor", 1.0))),
+                ]
+                run_command(filter_cmd, cwd=data_preprocessing_dir)
+            else:
+                final_h5 = unsampled_h5
 
         depth_reports.append(
             {
                 "depth": depth,
                 "processed_root": str(processed_root),
-                "unsampled_h5": str(unsampled_h5),
-                "output_h5": str(final_h5),
+                "unsampled_h5": None if merge_skipped else str(unsampled_h5),
+                "output_h5": None if merge_skipped else str(final_h5),
+                "h5_merge_skipped": merge_skipped,
+                "num_successful_datasets": successful_dataset_count,
+                "num_failed_datasets": len(failed_datasets),
+                "failed_datasets": failed_datasets,
                 "stages_run": stage_run_count,
                 "stages_skipped": stage_skip_count,
                 "datasets_skipped_as_complete": completed_dataset_skip_count,
             }
         )
+
+    failure_report_path = h5_output_dir / "dfs_failed_datasets.json"
+    failure_report = {
+        "dbinfer_root": str(dbinfer_root),
+        "num_input_datasets": len(dataset_dirs),
+        "depths": depths,
+        "num_failed_dataset_runs": len(all_failed_datasets),
+        "num_unique_failed_datasets": len(
+            {item["dataset_name"] for item in all_failed_datasets}
+        ),
+        "failed_datasets": all_failed_datasets,
+    }
+    failure_report_path.write_text(
+        json.dumps(json_ready(failure_report), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    if all_failed_datasets:
+        _status(
+            f"DFS finished with {len(all_failed_datasets)} failed dataset runs; "
+            f"failure report: {failure_report_path}",
+            level=logging.WARNING,
+        )
+    else:
+        _status(f"DFS failure report (no failures): {failure_report_path}")
 
     return {
         "dbinfer_root": str(dbinfer_root),
@@ -430,6 +505,9 @@ def run_dfs_exports(
         "resume": resume,
         "dbinfer_validation_skipped": bool(resume and skip_dbinfer_validation),
         "dfs_jobs": dfs_jobs,
+        "num_failed_dataset_runs": len(all_failed_datasets),
+        "num_unique_failed_datasets": failure_report["num_unique_failed_datasets"],
+        "failure_report": str(failure_report_path),
         "depths": depth_reports,
     }
 
@@ -445,7 +523,7 @@ def run_one_dfs_dataset(
     depth: int,
     resume: bool,
     stream_child_output: bool,
-) -> dict[str, int]:
+) -> dict[str, Any]:
     """Process one database while keeping all of its DFS stages sequential."""
 
     dataset_name = dataset_dir.name
@@ -458,6 +536,8 @@ def run_one_dfs_dataset(
             console=stream_child_output,
         )
         return {
+            "status": "skipped_complete",
+            "dataset_name": dataset_name,
             "stages_run": 0,
             "stages_skipped": 3,
             "datasets_skipped_as_complete": 1,
@@ -468,20 +548,72 @@ def run_one_dfs_dataset(
         ("dfs", pre_dir, "dfs", post_dir, f"configs/dfs/dfs-{depth}-sql.yaml"),
         ("post-dfs transform", post_dir, "transform", processed_dir, "configs/transform/post-dfs.yaml"),
     ]
-    stage_report = run_dfs_stage_sequence(
-        stages=stages,
-        data_preprocessing_dir=data_preprocessing_dir,
-        dfs_workspace_root=dfs_workspace_root,
-        depth=depth,
-        dataset_name=dataset_name,
-        resume=resume,
-        show_progress=stream_child_output,
-        stream_child_output=stream_child_output,
-    )
+    try:
+        stage_report = run_dfs_stage_sequence(
+            stages=stages,
+            data_preprocessing_dir=data_preprocessing_dir,
+            dfs_workspace_root=dfs_workspace_root,
+            depth=depth,
+            dataset_name=dataset_name,
+            resume=resume,
+            show_progress=stream_child_output,
+            stream_child_output=stream_child_output,
+        )
+    except Exception as exc:
+        failure = dfs_failure_record(dataset_dir, depth, exc)
+        stages_run = exc.stages_run if isinstance(exc, DFSStageError) else 0
+        stages_skipped = exc.stages_skipped if isinstance(exc, DFSStageError) else 0
+        if processed_dir.exists() or processed_dir.is_symlink():
+            try:
+                processed_complete, _ = dbinfer_dataset_is_complete(processed_dir)
+                if not processed_complete:
+                    remove_incomplete_stage_output(
+                        processed_dir,
+                        allowed_root=dfs_workspace_root,
+                    )
+                    failure["partial_processed_output_removed"] = True
+            except Exception as cleanup_exc:
+                failure["cleanup_error"] = (
+                    f"{type(cleanup_exc).__name__}: {cleanup_exc}"
+                )
+        _status(
+            f"[skip] DFS-{depth} {dataset_name}: {failure['stage']} failed with "
+            f"{failure['error_type']}: {failure['error']}",
+            level=logging.ERROR,
+        )
+        return {
+            "status": "failed",
+            "dataset_name": dataset_name,
+            "stages_run": stages_run,
+            "stages_skipped": stages_skipped,
+            "datasets_skipped_as_complete": 0,
+            "failure": failure,
+        }
     return {
+        "status": "succeeded",
+        "dataset_name": dataset_name,
         **stage_report,
         "datasets_skipped_as_complete": 0,
     }
+
+
+def dfs_failure_record(dataset_dir: Path, depth: int, exc: Exception) -> dict[str, Any]:
+    """Convert a per-dataset exception into a JSON-ready failure record."""
+
+    stage_name = exc.stage_name if isinstance(exc, DFSStageError) else "unknown"
+    cause = exc.cause if isinstance(exc, DFSStageError) else exc
+    record: dict[str, Any] = {
+        "dataset_name": dataset_dir.name,
+        "dataset_dir": str(dataset_dir),
+        "depth": depth,
+        "stage": stage_name,
+        "error_type": type(cause).__name__,
+        "error": str(cause),
+    }
+    if isinstance(cause, subprocess.CalledProcessError):
+        record["return_code"] = cause.returncode
+        record["command"] = [str(part) for part in cause.cmd]
+    return record
 
 
 def run_dfs_stage_sequence(
@@ -514,55 +646,65 @@ def run_dfs_stage_sequence(
         )
     for stage_index, stage in indexed_stages:
         stage_name, stage_input, preprocess_name, stage_output, config_file = stage
-        if resume and stage_index <= resume_through_index:
-            stages_skipped += 1
-            _status(
-                f"[resume] DFS-{depth} {dataset_name}: {stage_name} checkpoint available; skipping",
-                console=stream_child_output,
-            )
-            continue
-        if resume:
-            complete, reason = dbinfer_dataset_is_complete(stage_output)
-            if complete:
+        try:
+            if resume and stage_index <= resume_through_index:
                 stages_skipped += 1
                 _status(
-                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} complete; skipping",
+                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} checkpoint available; skipping",
                     console=stream_child_output,
                 )
                 continue
-            if stage_output.exists() or stage_output.is_symlink():
-                _status(
-                    f"[resume] DFS-{depth} {dataset_name}: {stage_name} incomplete ({reason}); rebuilding",
-                    console=stream_child_output,
+            if resume:
+                complete, reason = dbinfer_dataset_is_complete(stage_output)
+                if complete:
+                    stages_skipped += 1
+                    _status(
+                        f"[resume] DFS-{depth} {dataset_name}: {stage_name} complete; skipping",
+                        console=stream_child_output,
+                    )
+                    continue
+                if stage_output.exists() or stage_output.is_symlink():
+                    _status(
+                        f"[resume] DFS-{depth} {dataset_name}: {stage_name} incomplete ({reason}); rebuilding",
+                        console=stream_child_output,
+                    )
+                    remove_incomplete_stage_output(stage_output, allowed_root=dfs_workspace_root)
+
+            input_complete, input_reason = dbinfer_dataset_is_complete(stage_input)
+            if not input_complete:
+                raise RuntimeError(
+                    f"Cannot run DFS-{depth} {dataset_name} {stage_name}: "
+                    f"input {stage_input} is incomplete ({input_reason})."
                 )
-                remove_incomplete_stage_output(stage_output, allowed_root=dfs_workspace_root)
 
-        input_complete, input_reason = dbinfer_dataset_is_complete(stage_input)
-        if not input_complete:
-            raise RuntimeError(
-                f"Cannot run DFS-{depth} {dataset_name} {stage_name}: "
-                f"input {stage_input} is incomplete ({input_reason})."
+            _status(
+                f"DFS-{depth} {dataset_name}: {stage_name}",
+                console=stream_child_output,
             )
-
-        _status(
-            f"DFS-{depth} {dataset_name}: {stage_name}",
-            console=stream_child_output,
-        )
-        run_tab2graph_preprocess(
-            data_preprocessing_dir,
-            stage_input,
-            preprocess_name,
-            stage_output,
-            config_file,
-            stream_output=stream_child_output,
-        )
-        output_complete, output_reason = dbinfer_dataset_is_complete(stage_output)
-        if not output_complete:
-            raise RuntimeError(
-                f"DFS-{depth} {dataset_name} {stage_name} returned successfully but output "
-                f"{stage_output} is incomplete ({output_reason})."
+            run_tab2graph_preprocess(
+                data_preprocessing_dir,
+                stage_input,
+                preprocess_name,
+                stage_output,
+                config_file,
+                stream_output=stream_child_output,
             )
-        stages_run += 1
+            output_complete, output_reason = dbinfer_dataset_is_complete(stage_output)
+            if not output_complete:
+                raise RuntimeError(
+                    f"DFS-{depth} {dataset_name} {stage_name} returned successfully but output "
+                    f"{stage_output} is incomplete ({output_reason})."
+                )
+            stages_run += 1
+        except Exception as exc:
+            raise DFSStageError(
+                dataset_name=dataset_name,
+                depth=depth,
+                stage_name=stage_name,
+                cause=exc,
+                stages_run=stages_run,
+                stages_skipped=stages_skipped,
+            ) from exc
     return {"stages_run": stages_run, "stages_skipped": stages_skipped}
 
 

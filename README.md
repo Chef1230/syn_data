@@ -62,6 +62,13 @@ Edit `configs/default.yaml` for the normal pipeline:
 - `--skip-dbinfer-validation`: with `--resume-dfs`, trusts `export_report.json` and skips the slow per-dataset metadata/table/task file validation. Corrupt datasets will instead fail when DFS reaches them.
 - `--dfs-jobs`: maximum databases processed concurrently inside each DFS depth. The default is `1`; use a bounded value such as `32` on a 256-core host.
 
+Per-database DFS failures are logged and skipped so the remaining databases can
+continue. At the end of the run, the full failure list (dataset, depth, stage,
+error, and failed command when available) is written to
+`dfs_export.h5_output_dir/dfs_failed_datasets.json` and included in the final
+pipeline report. If every database fails at one depth, H5 merging for that depth
+is skipped.
+
 `--resume-dfs` requires the original `export_report.json` under `--dbinfer-root`.
 The same config must retain the original `dfs_export.workspace_root`, because
 that directory contains the per-depth pre/DFS/post checkpoints.

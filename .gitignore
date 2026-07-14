@@ -1,1 +1,33 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+
+# IDE / editor settings
+.vscode
+
+# Virtual environments
+.venv/
+
+# Project-generated data and outputs
+data/*
 outputs/*
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.cache/
+tmp/
+temp/
+
+
+# Local configuration overrides
+configs/local/
